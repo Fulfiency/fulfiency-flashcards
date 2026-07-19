@@ -1,0 +1,23 @@
+{
+  "name": "Fulfiency Flashcards",
+  "short_name": "Flashcards",
+  "description": "Pas de génie. Juste de la sueur.",
+  "start_url": "/dashboard",
+  "display": "standalone",
+  "background_color": "#0d1b2a",
+  "theme_color": "#0d1b2a",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
