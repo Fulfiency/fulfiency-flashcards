@@ -4,11 +4,13 @@ import GlobalSearch from "@/components/ui/GlobalSearch";
 import ThemeProvider from "@/components/ui/ThemeProvider";
 import GlobalShortcuts from "@/components/ui/GlobalShortcuts";
 import QuickAddCard from "@/components/ui/QuickAddCard";
+import OfflineSwRegister from "@/components/ui/OfflineSwRegister";
 
 export default function AppLayout({ children }: { children: React.ReactNode }) {
   return (
     <>
       <ThemeProvider />
+      <OfflineSwRegister />
       <GlobalShortcuts />
       <ParticlesCanvas />
       <NavBar />

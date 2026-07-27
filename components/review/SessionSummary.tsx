@@ -23,6 +23,17 @@ export default function SessionSummary({ total, ratings, startTime, cardTimes = 
   const perfect = ratings.again === 0 && ratings.hard === 0;
 
   useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        router.push("/dashboard");
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [router]);
+
+  useEffect(() => {
     const pieces = Array.from({ length: 40 }, (_, i) => ({
       id: i,
       left: 5 + Math.random() * 90,
@@ -100,6 +111,7 @@ export default function SessionSummary({ total, ratings, startTime, cardTimes = 
 
         <GoldButton onClick={() => router.push("/dashboard")} fullWidth>
           Retour aux decks
+          <kbd className="ml-2 text-[10px] font-mono px-1.5 py-0.5 rounded bg-black/20">Entrée</kbd>
         </GoldButton>
       </div>
     </>

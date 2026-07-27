@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { fsrs, Rating, type Card as FSRSCard, State } from "@/lib/fsrs";
 import type { Grade } from "ts-fsrs";
 import ReviewCard from "@/components/review/ReviewCard";
@@ -11,6 +11,7 @@ import SessionSummary from "@/components/review/SessionSummary";
 import ProgressBar from "@/components/ui/ProgressBar";
 import { playFlip, playRating, playSuccess } from "@/lib/sounds";
 import { getSettings } from "@/lib/settings";
+import { cacheDeckQueue, getCachedDeckQueue, queuePendingRating, getPendingRatings, clearPendingRatings } from "@/lib/offline";
 
 interface DbCard {
   id: string;
@@ -41,6 +42,7 @@ function formatInterval(d: Date): string {
 
 export default function ReviewPage() {
   const { deckId } = useParams<{ deckId: string }>();
+  const router = useRouter();
   const [queue, setQueue] = useState<DbCard[]>([]);
   const [current, setCurrent] = useState(0);
   const [flipped, setFlipped] = useState(false);
@@ -57,21 +59,46 @@ export default function ReviewPage() {
   useEffect(() => {
     async function load() {
       const now = new Date().toISOString();
-      const { data } = await supabase
-        .from("cards")
-        .select("*")
-        .eq("deck_id", deckId)
-        .lte("due", now)
-        .order("due");
+      try {
+        const { data } = await supabase
+          .from("cards")
+          .select("*")
+          .eq("deck_id", deckId)
+          .lte("due", now)
+          .order("due");
 
-      if (data && data.length > 0) {
-        setQueue(data);
-        computeIntervals(data[0]);
+        if (data) {
+          cacheDeckQueue(deckId, data);
+          if (data.length > 0) {
+            setQueue(data);
+            computeIntervals(data[0]);
+          }
+        }
+      } catch {
+        // hors-ligne ou requête échouée : retombe sur la dernière queue mise en cache pour ce deck
+        const cached = getCachedDeckQueue<DbCard>(deckId);
+        if (cached && cached.length > 0) {
+          setQueue(cached);
+          computeIntervals(cached[0]);
+        }
       }
       setLoading(false);
     }
     load();
+    flushPendingRatings();
+    window.addEventListener("online", flushPendingRatings);
+    return () => window.removeEventListener("online", flushPendingRatings);
   }, [deckId]);
+
+  async function flushPendingRatings() {
+    const pending = getPendingRatings();
+    if (pending.length === 0) return;
+    for (const p of pending) {
+      await supabase.from("cards").update(p.update).eq("id", p.cardId);
+      await supabase.from("review_logs").insert(p.reviewLog);
+    }
+    clearPendingRatings();
+  }
 
   const computeIntervals = useCallback((card: DbCard) => {
     const fsrsCard: FSRSCard = {
@@ -115,35 +142,46 @@ export default function ReviewPage() {
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) return;
 
-    const { error: updateError } = await supabase
-      .from("cards")
-      .update({
-        due: result.card.due.toISOString(),
-        stability: result.card.stability,
-        difficulty: result.card.difficulty,
-        elapsed_days: Math.floor(result.card.elapsed_days),
-        scheduled_days: Math.floor(result.card.scheduled_days),
-        reps: result.card.reps,
-        lapses: result.card.lapses,
-        state: Number(result.card.state),
-        last_review: new Date().toISOString(),
-      })
-      .eq("id", card.id)
-      .eq("user_id", user.id);
-
-    if (updateError) console.error("FSRS update failed:", updateError);
-
-    await supabase.from("review_logs").insert({
+    const update = {
+      due: result.card.due.toISOString(),
+      stability: result.card.stability,
+      difficulty: result.card.difficulty,
+      elapsed_days: Math.floor(result.card.elapsed_days),
+      scheduled_days: Math.floor(result.card.scheduled_days),
+      reps: result.card.reps,
+      lapses: result.card.lapses,
+      state: Number(result.card.state),
+      last_review: new Date().toISOString(),
+    };
+    const reviewLog = {
       card_id: card.id,
       user_id: user.id,
       rating,
+      review: new Date().toISOString(), // horodatage de la notation elle-même, pas de la synchro (utile hors-ligne)
       state: result.card.state,
       due: result.card.due.toISOString(),
       stability: result.card.stability,
       difficulty: result.card.difficulty,
       elapsed_days: result.card.elapsed_days,
       scheduled_days: result.card.scheduled_days,
-    });
+    };
+
+    if (!navigator.onLine) {
+      queuePendingRating({ cardId: card.id, update, reviewLog });
+    } else {
+      try {
+        const { error: updateError } = await supabase
+          .from("cards")
+          .update(update)
+          .eq("id", card.id)
+          .eq("user_id", user.id);
+        if (updateError) throw updateError;
+        await supabase.from("review_logs").insert(reviewLog);
+      } catch (e) {
+        console.error("FSRS update failed, mise en file d'attente hors-ligne:", e);
+        queuePendingRating({ cardId: card.id, update, reviewLog });
+      }
+    }
 
     if (getSettings().soundEnabled) playRating(rating);
 
@@ -169,6 +207,16 @@ export default function ReviewPage() {
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (queue.length === 0 && (e.key === "Enter" || e.key === " ")) {
+        e.preventDefault();
+        router.push("/dashboard");
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        router.push("/dashboard");
+        return;
+      }
       if (e.key === " " || e.key === "Enter") {
         e.preventDefault();
         if (!flipped && !done && queue.length > 0) {
@@ -183,7 +231,7 @@ export default function ReviewPage() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [flipped, done, current, queue]);
+  }, [flipped, done, current, queue, router]);
 
   if (loading) return <div className="text-[var(--slate)] text-center py-12">Chargement...</div>;
 
@@ -194,6 +242,10 @@ export default function ReviewPage() {
           Aucune carte à réviser
         </h2>
         <p className="text-[var(--slate)]">Reviens plus tard !</p>
+        <p className="text-xs text-[var(--slate)] mt-4">
+          <kbd className="font-mono px-1.5 py-0.5 rounded bg-[var(--navy-mid)]">Entrée</kbd> ou{" "}
+          <kbd className="font-mono px-1.5 py-0.5 rounded bg-[var(--navy-mid)]">Échap</kbd> pour retourner aux decks
+        </p>
       </div>
     );
   }

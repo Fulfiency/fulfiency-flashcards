@@ -10,10 +10,9 @@ const MAX_CHARS = 40000; // garde-fou input tokens
 const MAX_FILE_SIZE = 8 * 1024 * 1024; // 8 Mo (Next.js plafonne le body des route handlers à 10 Mo)
 const MAX_EXISTING_FRONTS_CHARS = 4000; // garde-fou tokens pour la liste d'exclusion
 
-// Rate limit en mémoire (anti-rafale) — remis à zéro à chaque redémarrage, suffisant pour limiter l'abus au coup par coup.
+// Anti-rafale : basé sur ai_generation_log (même table que le quota mensuel), résiste aux redémarrages/redéploiements multi-instance.
 const RATE_LIMIT_MAX = 5;
 const RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
-const rateLimitHits = new Map<string, number[]>();
 
 // Limite mensuelle persistée en base (table ai_generation_log), résiste aux redémarrages/redéploiements.
 const MONTHLY_LIMIT = 50;
@@ -28,16 +27,17 @@ function isUnlimited(email: string | undefined | null): boolean {
   return !!email && UNLIMITED_EMAILS.includes(email.toLowerCase());
 }
 
-function isRateLimited(userId: string): boolean {
-  const now = Date.now();
-  const hits = (rateLimitHits.get(userId) ?? []).filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
-  if (hits.length >= RATE_LIMIT_MAX) {
-    rateLimitHits.set(userId, hits);
-    return true;
-  }
-  hits.push(now);
-  rateLimitHits.set(userId, hits);
-  return false;
+async function isRateLimited(
+  supabase: Awaited<ReturnType<typeof createClient>>,
+  userId: string
+): Promise<boolean> {
+  const since = new Date(Date.now() - RATE_LIMIT_WINDOW_MS).toISOString();
+  const { count } = await supabase
+    .from("ai_generation_log")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", userId)
+    .gte("created_at", since);
+  return (count ?? 0) >= RATE_LIMIT_MAX;
 }
 
 function buildPrompt(count: number, text: string, existingFronts: string[]) {
@@ -106,7 +106,7 @@ export async function GET() {
   return NextResponse.json({ used: count ?? 0, limit: MONTHLY_LIMIT });
 }
 
-function extractJson(raw: string): unknown {
+export function extractJson(raw: string): unknown {
   const start = raw.lastIndexOf("[");
   const end = raw.lastIndexOf("]");
   if (start === -1 || end === -1 || end < start) return null;
@@ -115,6 +115,70 @@ function extractJson(raw: string): unknown {
   } catch {
     return null;
   }
+}
+
+export function isValidCard(c: unknown): c is { front: string; back: string } {
+  return (
+    !!c &&
+    typeof (c as { front?: unknown }).front === "string" &&
+    typeof (c as { back?: unknown }).back === "string" &&
+    (c as { front: string }).front.trim().length > 0 &&
+    (c as { back: string }).back.trim().length > 0 &&
+    (c as { front: string }).front.length <= 220 &&
+    (c as { back: string }).back.length <= 400
+  );
+}
+
+// Scanne le texte accumulé depuis le début du tableau JSON final et retourne les objets top-level
+// {..} complets trouvés après `consumedUpto`, avec le nouveau curseur de consommation. Permet
+// d'émettre chaque carte dès qu'elle est terminée, sans attendre la fin de la génération.
+export function extractNewCompleteObjects(
+  arrayText: string,
+  consumedUpto: number
+): { objects: unknown[]; consumedUpto: number } {
+  const objects: unknown[] = [];
+  let depth = 0;
+  let objStart = -1;
+  // consumedUpto tombe toujours juste après un objet top-level complet, donc en dehors de toute
+  // chaîne : on peut repartir avec un état de parsing de chaîne neutre à chaque appel.
+  let inString = false;
+  let escaped = false;
+  let i = consumedUpto;
+  for (; i < arrayText.length; i++) {
+    const ch = arrayText[i];
+
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (ch === "{") {
+      if (depth === 0) objStart = i;
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0 && objStart !== -1) {
+        try {
+          objects.push(JSON.parse(arrayText.slice(objStart, i + 1)));
+        } catch {
+          // objet malformé, ignoré silencieusement (validé de toute façon à la fin)
+        }
+        consumedUpto = i + 1;
+        objStart = -1;
+      }
+    }
+  }
+  return { objects, consumedUpto };
+}
+
+function sseEvent(data: unknown): string {
+  return `data: ${JSON.stringify(data)}\n\n`;
 }
 
 export async function POST(request: Request) {
@@ -175,7 +239,7 @@ export async function POST(request: Request) {
 
   const unlimited = isUnlimited(user.email);
 
-  if (!unlimited && isRateLimited(user.id)) {
+  if (!unlimited && (await isRateLimited(supabase, user.id))) {
     return NextResponse.json(
       { error: `Limite de ${RATE_LIMIT_MAX} générations toutes les 10 minutes atteinte, réessaie plus tard.` },
       { status: 429 }
@@ -200,59 +264,102 @@ export async function POST(request: Request) {
   const anthropic = new Anthropic({ apiKey });
   const prompt = buildPrompt(count, text, existingFronts);
 
-  async function callModel(messages: Anthropic.MessageParam[]) {
-    const msg = await anthropic.messages.create({
-      model: MODEL,
-      max_tokens: 6000,
-      temperature: 0.3,
-      messages,
-    });
-    const block = msg.content[0];
-    return block.type === "text" ? block.text : "";
-  }
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      function send(data: unknown) {
+        controller.enqueue(encoder.encode(sseEvent(data)));
+      }
 
-  let raw: string;
-  try {
-    raw = await callModel([{ role: "user", content: prompt }]);
-  } catch (e) {
-    console.error("Anthropic call error:", e);
-    return NextResponse.json({ error: "Erreur lors de la génération IA" }, { status: 502 });
-  }
+      async function streamModel(messages: Anthropic.MessageParam[]): Promise<string> {
+        let raw = "";
+        let arrayStart = -1;
+        let consumedUpto = 0;
+        const emittedFronts = new Set<string>();
 
-  let parsed = extractJson(raw);
-  if (!parsed) {
-    // Une seule relance : on force une sortie JSON pure, sans raisonnement.
-    try {
-      raw = await callModel([
-        { role: "user", content: prompt },
-        { role: "assistant", content: raw },
-        { role: "user", content: 'Ta réponse ne contient pas de JSON valide. Réponds UNIQUEMENT avec le tableau JSON demandé, sans aucun texte, raisonnement ou balise de code autour.' },
-      ]);
-    } catch (e) {
-      console.error("Anthropic retry error:", e);
-      return NextResponse.json({ error: "Erreur lors de la génération IA" }, { status: 502 });
-    }
-    parsed = extractJson(raw);
-  }
+        const modelStream = anthropic.messages.stream({
+          model: MODEL,
+          max_tokens: 6000,
+          temperature: 0.3,
+          messages,
+        });
 
-  if (!parsed || !Array.isArray(parsed)) {
-    return NextResponse.json({ error: "Réponse IA invalide" }, { status: 502 });
-  }
+        modelStream.on("text", (delta) => {
+          raw += delta;
+          if (arrayStart === -1) {
+            arrayStart = raw.indexOf("[");
+            if (arrayStart === -1) return;
+          }
+          const { objects, consumedUpto: newConsumed } = extractNewCompleteObjects(
+            raw.slice(arrayStart),
+            consumedUpto
+          );
+          consumedUpto = newConsumed;
+          for (const obj of objects) {
+            if (isValidCard(obj) && !emittedFronts.has(obj.front)) {
+              emittedFronts.add(obj.front);
+              send({ type: "card", front: obj.front, back: obj.back });
+            }
+          }
+        });
 
-  const cards = (parsed as { front: string; back: string }[]).filter(
-    (c) =>
-      c &&
-      typeof c.front === "string" &&
-      typeof c.back === "string" &&
-      c.front.trim().length > 0 &&
-      c.back.trim().length > 0 &&
-      c.front.length <= 220 &&
-      c.back.length <= 400
-  );
+        await modelStream.finalMessage();
+        return raw;
+      }
 
-  if (cards.length > 0) {
-    await supabase.from("ai_generation_log").insert({ user_id: user.id });
-  }
+      send({ type: "phase", phase: "generating" });
 
-  return NextResponse.json({ cards, truncated });
+      let raw: string;
+      try {
+        raw = await streamModel([{ role: "user", content: prompt }]);
+      } catch (e) {
+        console.error("Anthropic call error:", e);
+        send({ type: "error", error: "Erreur lors de la génération IA" });
+        controller.close();
+        return;
+      }
+
+      let parsed = extractJson(raw);
+      if (!parsed) {
+        // Une seule relance : on force une sortie JSON pure, sans raisonnement. Pas de streaming
+        // incrémental ici (cas rare), les cartes de la relance arrivent d'un bloc à la fin.
+        try {
+          raw = await streamModel([
+            { role: "user", content: prompt },
+            { role: "assistant", content: raw },
+            { role: "user", content: 'Ta réponse ne contient pas de JSON valide. Réponds UNIQUEMENT avec le tableau JSON demandé, sans aucun texte, raisonnement ou balise de code autour.' },
+          ]);
+        } catch (e) {
+          console.error("Anthropic retry error:", e);
+          send({ type: "error", error: "Erreur lors de la génération IA" });
+          controller.close();
+          return;
+        }
+        parsed = extractJson(raw);
+      }
+
+      if (!parsed || !Array.isArray(parsed)) {
+        send({ type: "error", error: "Réponse IA invalide" });
+        controller.close();
+        return;
+      }
+
+      const cards = (parsed as unknown[]).filter(isValidCard);
+
+      if (cards.length > 0) {
+        await supabase.from("ai_generation_log").insert({ user_id: user.id });
+      }
+
+      send({ type: "done", cards, truncated });
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  });
 }

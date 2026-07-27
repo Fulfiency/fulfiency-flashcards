@@ -12,7 +12,33 @@ interface SearchResult {
   title: string;
   subtitle: string;
   tags?: string[];
+  score: number;
 }
+
+// Score de correspondance floue : sous-séquence des lettres de `query` dans `text`, tolère
+// fautes de frappe/lettres manquantes/ordre imparfait. 0 = pas de match, plus haut = meilleur.
+function fuzzyScore(query: string, text: string): number {
+  const q = query.toLowerCase();
+  const t = text.toLowerCase();
+  if (!q) return 0;
+  if (t.includes(q)) return 1000 - (t.indexOf(q) === 0 ? 0 : 10) + Math.max(0, 50 - t.length);
+
+  let qi = 0;
+  let score = 0;
+  let streak = 0;
+  for (let ti = 0; ti < t.length && qi < q.length; ti++) {
+    if (t[ti] === q[qi]) {
+      qi++;
+      streak++;
+      score += streak; // bonus pour lettres consécutives
+    } else {
+      streak = 0;
+    }
+  }
+  return qi === q.length ? score : 0;
+}
+
+const MAX_SCANNED_CARDS = 2000; // évite de rapatrier des decks entiers pour un compte très volumineux
 
 export default function GlobalSearch() {
   const [open, setOpen] = useState(false);
@@ -23,6 +49,7 @@ export default function GlobalSearch() {
   const inputRef = useRef<HTMLInputElement>(null);
   const router = useRouter();
   const supabase = createClient();
+  const poolRef = useRef<SearchResult[] | null>(null);
 
   // Ctrl+K to open
   useEffect(() => {
@@ -43,77 +70,73 @@ export default function GlobalSearch() {
       setQuery("");
       setResults([]);
       setSelectedIdx(0);
+      loadPool();
     }
   }, [open]);
 
-  const search = useCallback(
-    async (q: string) => {
-      if (!q.trim()) { setResults([]); return; }
-      setLoading(true);
+  // Charge une seule fois à l'ouverture tout ce qui est fouillable (decks + cartes), pour permettre
+  // un scoring flou (tolérant aux fautes de frappe) côté client sans aller-retour DB par frappe.
+  const loadPool = useCallback(async () => {
+    setLoading(true);
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) { setLoading(false); return; }
 
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) { setLoading(false); return; }
-
-      const term = `%${q.trim()}%`;
-      const res: SearchResult[] = [];
-
-      // Search decks
-      const { data: decks } = await supabase
-        .from("decks")
-        .select("id, name, description")
-        .eq("user_id", user.id)
-        .or(`name.ilike.${term},description.ilike.${term}`)
-        .limit(5);
-
-      if (decks) {
-        for (const d of decks) {
-          res.push({
-            type: "deck",
-            id: d.id,
-            title: d.name,
-            subtitle: d.description || "Deck",
-          });
-        }
-      }
-
-      // Search cards (front/back)
-      const { data: cards } = await supabase
+    const [{ data: decks }, { data: cards }] = await Promise.all([
+      supabase.from("decks").select("id, name, description").eq("user_id", user.id),
+      supabase
         .from("cards")
         .select("id, front, back, deck_id, tags")
         .eq("user_id", user.id)
-        .or(`front.ilike.${term},back.ilike.${term}`)
-        .limit(10);
+        .order("created_at", { ascending: false })
+        .limit(MAX_SCANNED_CARDS),
+    ]);
 
-      if (cards) {
-        // Get deck names for card results
-        const deckIds = [...new Set(cards.map((c) => c.deck_id))];
-        const { data: cardDecks } = await supabase
-          .from("decks")
-          .select("id, name")
-          .in("id", deckIds);
-
-        const deckMap = new Map((cardDecks ?? []).map((d) => [d.id, d.name]));
-
-        for (const c of cards) {
-          const stripHtml = (s: string) => s.replace(/<[^>]*>/g, "");
-          res.push({
-            type: "card",
-            id: c.id,
-            deckId: c.deck_id,
-            deckName: deckMap.get(c.deck_id) || "Deck",
-            title: stripHtml(c.front).slice(0, 80),
-            subtitle: stripHtml(c.back).slice(0, 80),
-            tags: c.tags,
-          });
-        }
+    const pool: SearchResult[] = [];
+    if (decks) {
+      for (const d of decks) {
+        pool.push({ type: "deck", id: d.id, title: d.name, subtitle: d.description || "Deck", score: 0 });
       }
+    }
+    if (cards) {
+      const deckIds = [...new Set(cards.map((c) => c.deck_id))];
+      const { data: cardDecks } = deckIds.length
+        ? await supabase.from("decks").select("id, name").in("id", deckIds)
+        : { data: [] as { id: string; name: string }[] };
+      const deckMap = new Map((cardDecks ?? []).map((d) => [d.id, d.name]));
+      const stripHtml = (s: string) => s.replace(/<[^>]*>/g, "");
+      for (const c of cards) {
+        pool.push({
+          type: "card",
+          id: c.id,
+          deckId: c.deck_id,
+          deckName: deckMap.get(c.deck_id) || "Deck",
+          title: stripHtml(c.front).slice(0, 80),
+          subtitle: stripHtml(c.back).slice(0, 80),
+          tags: c.tags,
+          score: 0,
+        });
+      }
+    }
+    poolRef.current = pool;
+    setLoading(false);
+  }, [supabase]);
 
-      setResults(res);
-      setSelectedIdx(0);
-      setLoading(false);
-    },
-    [supabase]
-  );
+  const search = useCallback((q: string) => {
+    const term = q.trim();
+    if (!term || !poolRef.current) { setResults([]); return; }
+
+    const scored = poolRef.current
+      .map((item) => {
+        const haystack = `${item.title} ${item.subtitle} ${(item.tags ?? []).join(" ")}`;
+        return { ...item, score: fuzzyScore(term, haystack) };
+      })
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 15);
+
+    setResults(scored);
+    setSelectedIdx(0);
+  }, []);
 
   useEffect(() => {
     const timer = setTimeout(() => search(query), 250);

@@ -19,13 +19,17 @@ interface CardDraft {
 }
 
 const COLORS = ["#c9a552", "#73866d", "#e8832a", "#e05c5c", "#a7bcb7", "#4a9eff"];
-let nextId = 1;
 
 export default function CreatePage() {
+  // Compteur d'ids par instance (pas module-level) : un `let` partagé au niveau module se faisait
+  // incrémenter côté serveur ET côté client (et deux fois en double-render StrictMode), ce qui
+  // désynchronisait l'id de la première carte entre le HTML SSR et l'hydratation client.
+  const nextIdRef = useRef(1);
+  const genId = () => nextIdRef.current++;
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [color, setColor] = useState("#c9a552");
-  const [cards, setCards] = useState<CardDraft[]>([{ id: nextId++, front: "", back: "", tags: [] }]);
+  const [cards, setCards] = useState<CardDraft[]>(() => [{ id: 0, front: "", back: "", tags: [] }]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [showSetup, setShowSetup] = useState(true);
@@ -97,7 +101,7 @@ export default function CreatePage() {
   const allTags = [...new Set([...allExistingTags, ...cards.flatMap((c) => c.tags)])];
 
   function addCard() {
-    const newCard = { id: nextId++, front: "", back: "", tags: [] };
+    const newCard = { id: genId(), front: "", back: "", tags: [] };
     setCards((prev) => [...prev, newCard]);
     if (snd()) playAdd();
     setTimeout(() => {
@@ -114,7 +118,7 @@ export default function CreatePage() {
   function duplicateCard(id: number) {
     const src = cards.find((c) => c.id === id);
     if (!src) return;
-    const copy = { id: nextId++, front: src.front, back: src.back, tags: [...src.tags] };
+    const copy = { id: genId(), front: src.front, back: src.back, tags: [...src.tags] };
     const idx = cards.findIndex((c) => c.id === id);
     setCards((prev) => [...prev.slice(0, idx + 1), copy, ...prev.slice(idx + 1)]);
     if (snd()) playAdd();
@@ -239,25 +243,56 @@ export default function CreatePage() {
       body.append("count", String(genCount));
       body.append("existingFronts", JSON.stringify(existingFronts));
       const res = await fetch("/api/generate-cards", { method: "POST", body, signal: controller.signal });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Erreur de génération");
+      if (!res.ok || !res.body) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || "Erreur de génération");
+      }
 
-      const generated: CardDraft[] = data.cards.map((c: { front: string; back: string }) => ({
-        id: nextId++,
-        front: c.front,
-        back: c.back,
-        tags: [],
-      }));
+      let firstBase: { base: CardDraft[]; onlyEmpty: boolean } | null = null;
+      const generated: { id: number; front: string; back: string }[] = [];
+      let sawError: string | null = null;
+      let truncated = false;
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { done: streamDone, value } = await reader.read();
+        if (streamDone) break;
+        buf += decoder.decode(value, { stream: true });
+        const chunks = buf.split("\n\n");
+        buf = chunks.pop() ?? "";
+        for (const chunk of chunks) {
+          if (!chunk.startsWith("data: ")) continue;
+          const evt = JSON.parse(chunk.slice(6));
+          if (evt.type === "phase") {
+            setGenPhase("Génération des cartes par l'IA...");
+          } else if (evt.type === "card") {
+            const newCard: CardDraft = { id: genId(), front: evt.front, back: evt.back, tags: [] };
+            generated.push({ id: newCard.id, front: newCard.front, back: newCard.back });
+            setCards((prev) => {
+              if (!firstBase) {
+                const base = replaceIds ? prev.filter((c) => !excludedIds.has(c.id)) : prev;
+                const onlyEmpty = base.length === 1 && !base[0].front.trim() && !base[0].back.trim();
+                firstBase = { base, onlyEmpty };
+                return onlyEmpty ? [newCard] : [...base, newCard];
+              }
+              return [...prev, newCard];
+            });
+          } else if (evt.type === "error") {
+            sawError = evt.error;
+          } else if (evt.type === "done") {
+            truncated = !!evt.truncated;
+          }
+        }
+      }
+
+      if (sawError) throw new Error(sawError);
       if (generated.length === 0) throw new Error("Aucune carte générée");
 
-      setCards((prev) => {
-        const base = replaceIds ? prev.filter((c) => !excludedIds.has(c.id)) : prev;
-        const onlyEmpty = base.length === 1 && !base[0].front.trim() && !base[0].back.trim();
-        return onlyEmpty ? generated : [...base, ...generated];
-      });
       setLastGenIds(generated.map((c) => c.id));
-      setLastGenSnapshot(generated.map((c) => ({ id: c.id, front: c.front, back: c.back })));
-      if (data.truncated) {
+      setLastGenSnapshot(generated);
+      if (truncated) {
         setGenWarning("Le PDF est long : seul le début du document a été utilisé pour générer les cartes.");
       }
       setShowGenModal(false);

@@ -17,6 +17,23 @@ interface RatingDist {
   easy: number;
 }
 
+interface ReviewLog {
+  rating: number;
+  review: string;
+}
+
+const RATING_LABELS: Record<number, string> = { 1: "À revoir", 2: "Difficile", 3: "Bien", 4: "Facile" };
+
+function downloadBlob(content: string, filename: string, mime: string) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 export default function StatsPage() {
   const [dailyData, setDailyData] = useState<DayData[]>([]);
   const [ratingDist, setRatingDist] = useState<RatingDist>({ again: 0, hard: 0, good: 0, easy: 0 });
@@ -31,6 +48,7 @@ export default function StatsPage() {
   const [avgTimePerCard, setAvgTimePerCard] = useState(0);
   const [graphDecks, setGraphDecks] = useState<{ id: string; name: string; color: string }[]>([]);
   const [graphCards, setGraphCards] = useState<{ id: string; front: string; deck_id: string; tags: string[] }[]>([]);
+  const [rawLogs, setRawLogs] = useState<ReviewLog[]>([]);
   const supabase = createClient();
 
   useEffect(() => {
@@ -62,6 +80,7 @@ export default function StatsPage() {
 
       if (!logs) return;
 
+      setRawLogs(logs);
       setTotalReviews(logs.length);
 
       // Rating distribution
@@ -140,6 +159,23 @@ export default function StatsPage() {
   const maxDaily = Math.max(...dailyData.map((d) => d.count), 1);
   const maxHeat = Math.max(...Array.from(heatmap.values()), 1);
 
+  function exportCsv() {
+    const header = "date,heure,note\n";
+    const rows = [...rawLogs]
+      .sort((a, b) => new Date(a.review).getTime() - new Date(b.review).getTime())
+      .map((l) => {
+        const d = new Date(l.review);
+        return `${d.toISOString().slice(0, 10)},${d.toTimeString().slice(0, 8)},${RATING_LABELS[l.rating] ?? l.rating}`;
+      });
+    downloadBlob(header + rows.join("\n"), `fulfiency-stats-${new Date().toISOString().slice(0, 10)}.csv`, "text/csv;charset=utf-8");
+  }
+
+  function exportPdf() {
+    // Pas de lib PDF ajoutée pour une seule feature d'export : on s'appuie sur "imprimer en PDF"
+    // du navigateur, guidé par la classe print-only ci-dessous.
+    window.print();
+  }
+
   const donutData = [
     { label: "À revoir", value: ratingDist.again, color: "var(--error)" },
     { label: "Difficile", value: ratingDist.hard, color: "var(--hard)" },
@@ -149,9 +185,28 @@ export default function StatsPage() {
 
   return (
     <div>
-      <h1 className="font-[family-name:var(--font-playfair-display)] text-3xl font-bold mb-6">
-        Statistiques
-      </h1>
+      <div className="flex items-center justify-between mb-6 gap-4 flex-wrap print:hidden">
+        <h1 className="font-[family-name:var(--font-playfair-display)] text-3xl font-bold">
+          Statistiques
+        </h1>
+        <div className="flex gap-2">
+          <button
+            onClick={exportCsv}
+            disabled={rawLogs.length === 0}
+            className="text-xs py-2 px-4 rounded-lg border border-[rgba(201,165,82,0.4)] text-[var(--gold)]
+              hover:bg-[rgba(201,165,82,0.1)] transition-all disabled:opacity-50"
+          >
+            Exporter CSV
+          </button>
+          <button
+            onClick={exportPdf}
+            className="text-xs py-2 px-4 rounded-lg border border-[rgba(201,165,82,0.4)] text-[var(--gold)]
+              hover:bg-[rgba(201,165,82,0.1)] transition-all"
+          >
+            Exporter PDF
+          </button>
+        </div>
+      </div>
 
       {/* KPIs */}
       <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-7 gap-3 mb-6">
